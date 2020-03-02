@@ -22,7 +22,6 @@ import org.apache.kafka.clients.consumer.internals.SubscriptionState;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
-import org.apache.kafka.common.Node;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
@@ -37,11 +36,13 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 
 /**
@@ -187,6 +188,7 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
 
         // update the consumed offset
         final Map<TopicPartition, List<ConsumerRecord<K, V>>> results = new HashMap<>();
+        final List<TopicPartition> toClear = new ArrayList<>();
 
         for (Map.Entry<TopicPartition, List<ConsumerRecord<K, V>>> entry : this.records.entrySet()) {
             if (!subscriptions.isPaused(entry.getKey())) {
@@ -200,14 +202,17 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
 
                     if (assignment().contains(entry.getKey()) && rec.offset() >= position) {
                         results.computeIfAbsent(entry.getKey(), partition -> new ArrayList<>()).add(rec);
+                        Metadata.LeaderAndEpoch leaderAndEpoch = new Metadata.LeaderAndEpoch(Optional.empty(), rec.leaderEpoch());
                         SubscriptionState.FetchPosition newPosition = new SubscriptionState.FetchPosition(
-                                rec.offset() + 1, rec.leaderEpoch(), new Metadata.LeaderAndEpoch(Node.noNode(), rec.leaderEpoch()));
+                                rec.offset() + 1, rec.leaderEpoch(), leaderAndEpoch);
                         subscriptions.position(entry.getKey(), newPosition);
                     }
                 }
+                toClear.add(entry.getKey());
             }
         }
-        this.records.clear();
+
+        toClear.forEach(p -> this.records.remove(p));
         return new ConsumerRecords<>(results);
     }
 
@@ -290,18 +295,31 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
         subscriptions.seek(partition, offsetAndMetadata.offset());
     }
 
+    @Deprecated
     @Override
-    public synchronized OffsetAndMetadata committed(TopicPartition partition) {
-        ensureNotClosed();
-        if (subscriptions.isAssigned(partition)) {
-            return committed.get(partition);
-        }
-        return new OffsetAndMetadata(0);
+    public synchronized OffsetAndMetadata committed(final TopicPartition partition) {
+        return committed(Collections.singleton(partition)).get(partition);
+    }
+
+    @Deprecated
+    @Override
+    public OffsetAndMetadata committed(final TopicPartition partition, final Duration timeout) {
+        return committed(partition);
     }
 
     @Override
-    public OffsetAndMetadata committed(TopicPartition partition, final Duration timeout) {
-        return committed(partition);
+    public synchronized Map<TopicPartition, OffsetAndMetadata> committed(final Set<TopicPartition> partitions) {
+        ensureNotClosed();
+
+        return partitions.stream()
+            .filter(committed::containsKey)
+            .collect(Collectors.toMap(tp -> tp, tp -> subscriptions.isAssigned(tp) ?
+                committed.get(tp) : new OffsetAndMetadata(0)));
+    }
+
+    @Override
+    public synchronized Map<TopicPartition, OffsetAndMetadata> committed(final Set<TopicPartition> partitions, final Duration timeout) {
+        return committed(partitions);
     }
 
     @Override
@@ -446,7 +464,6 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     @SuppressWarnings("deprecation")
     @Override
     public synchronized void close(long timeout, TimeUnit unit) {
-        ensureNotClosed();
         this.closed = true;
     }
 
@@ -542,6 +559,15 @@ public class MockConsumer<K, V> implements Consumer<K, V> {
     @Override
     public Map<TopicPartition, Long> endOffsets(Collection<TopicPartition> partitions, Duration timeout) {
         return endOffsets(partitions);
+    }
+
+    @Override
+    public ConsumerGroupMetadata groupMetadata() {
+        return null;
+    }
+
+    @Override
+    public void enforceRebalance() {
     }
 
     @Override

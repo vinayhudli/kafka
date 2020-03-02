@@ -18,7 +18,7 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.common.serialization.Serializer;
 import org.apache.kafka.streams.errors.StreamsException;
-import org.apache.kafka.streams.kstream.internals.ChangedSerializer;
+import org.apache.kafka.streams.kstream.internals.WrappingNullableSerializer;
 import org.apache.kafka.streams.processor.StreamPartitioner;
 import org.apache.kafka.streams.processor.TopicNameExtractor;
 
@@ -66,10 +66,10 @@ public class SinkNode<K, V> extends ProcessorNode<K, V> {
             valSerializer = (Serializer<V>) context.valueSerde().serializer();
         }
 
-        // if value serializers are for {@code Change} values, set the inner serializer when necessary
-        if (valSerializer instanceof ChangedSerializer &&
-                ((ChangedSerializer) valSerializer).inner() == null) {
-            ((ChangedSerializer) valSerializer).setInner(context.valueSerde().serializer());
+        // if value serializers are internal wrapping serializers that may need to be given the default serializer
+        // then pass it the default one from the context
+        if (valSerializer instanceof WrappingNullableSerializer) {
+            ((WrappingNullableSerializer) valSerializer).setIfUnset(context.valueSerde().serializer());
         }
     }
 
@@ -91,9 +91,9 @@ public class SinkNode<K, V> extends ProcessorNode<K, V> {
             final String keyClass = key == null ? "unknown because key is null" : key.getClass().getName();
             final String valueClass = value == null ? "unknown because value is null" : value.getClass().getName();
             throw new StreamsException(
-                    String.format("A serializer (key: %s / value: %s) is not compatible to the actual key or value type " +
+                    String.format("ClassCastException while producing data to a sink topic. A serializer (key: %s / value: %s) is not compatible to the actual key or value type " +
                                     "(key type: %s / value type: %s). Change the default Serdes in StreamConfig or " +
-                                    "provide correct Serdes via method parameters.",
+                                    "provide correct Serdes via method parameters (for example if using the DSL, `#to(String topic, Produced<K, V> produced)` with `Produced.keySerde(WindowedSerdes.timeWindowedSerdeFrom(String.class))`).",
                                     keySerializer.getClass().getName(),
                                     valSerializer.getClass().getName(),
                                     keyClass,

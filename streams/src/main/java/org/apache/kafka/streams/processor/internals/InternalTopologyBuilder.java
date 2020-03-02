@@ -16,9 +16,9 @@
  */
 package org.apache.kafka.streams.processor.internals;
 
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.Deserializer;
 import org.apache.kafka.common.serialization.Serializer;
-import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.errors.TopologyException;
@@ -29,8 +29,8 @@ import org.apache.kafka.streams.processor.TimestampExtractor;
 import org.apache.kafka.streams.processor.TopicNameExtractor;
 import org.apache.kafka.streams.state.StoreBuilder;
 import org.apache.kafka.streams.state.internals.SessionStoreBuilder;
-import org.apache.kafka.streams.state.internals.WindowStoreBuilder;
 import org.apache.kafka.streams.state.internals.TimestampedWindowStoreBuilder;
+import org.apache.kafka.streams.state.internals.WindowStoreBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,6 +50,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class InternalTopologyBuilder {
 
@@ -60,10 +61,8 @@ public class InternalTopologyBuilder {
     // node factories in a topological order
     private final Map<String, NodeFactory> nodeFactories = new LinkedHashMap<>();
 
-    // state factories
     private final Map<String, StateStoreFactory> stateFactories = new HashMap<>();
 
-    // built global state stores
     private final Map<String, StoreBuilder> globalStateBuilders = new LinkedHashMap<>();
 
     // built global state stores
@@ -84,12 +83,8 @@ public class InternalTopologyBuilder {
     // map from source processor names to regex subscription patterns
     private final Map<String, Pattern> nodeToSourcePatterns = new LinkedHashMap<>();
 
-    // map from sink processor names to subscribed topic (without application-id prefix for internal topics)
+    // map from sink processor names to sink topic (without application-id prefix for internal topics)
     private final Map<String, String> nodeToSinkTopic = new HashMap<>();
-
-    // map from topics to their matched regex patterns, this is to ensure one topic is passed through on source node
-    // even if it can be matched by multiple regex patterns
-    private final Map<String, Pattern> topicToPatterns = new HashMap<>();
 
     // map from state store names to all the topics subscribed from source processors that
     // are connected to these state stores
@@ -101,6 +96,9 @@ public class InternalTopologyBuilder {
 
     // map from state store names to this state store's corresponding changelog topic if possible
     private final Map<String, String> storeToChangelogTopic = new HashMap<>();
+
+    // map from changelog topic name to its corresponding state store.
+    private final Map<String, String> changelogTopicToStore = new HashMap<>();
 
     // all global topics
     private final Set<String> globalTopics = new HashSet<>();
@@ -115,11 +113,14 @@ public class InternalTopologyBuilder {
 
     private final QuickUnion<String> nodeGrouper = new QuickUnion<>();
 
-    private SubscriptionUpdates subscriptionUpdates = new SubscriptionUpdates();
+    // Used to capture subscribed topics via Patterns discovered during the partition assignment process.
+    private final Set<String> subscriptionUpdates = new HashSet<>();
 
     private String applicationId = null;
 
-    private Pattern topicPattern = null;
+    private Pattern sourceTopicPattern = null;
+
+    private List<String> sourceTopicCollection = null;
 
     private Map<Integer, Set<String>> nodeGroups = null;
 
@@ -214,6 +215,10 @@ public class InternalTopologyBuilder {
             return new Processor(name, new HashSet<>(stateStoreNames));
         }
     }
+
+    // Map from topics to their matched regex patterns, this is to ensure one topic is passed through on source node
+    // even if it can be matched by multiple regex patterns. Only used by SourceNodeFactory
+    private final Map<String, Pattern> topicToPatterns = new HashMap<>();
 
     private class SourceNodeFactory extends NodeFactory {
         private final List<String> topics;
@@ -599,12 +604,17 @@ public class InternalTopologyBuilder {
         nodeGroups = null;
     }
 
+    public Map<String, String> getChangelogTopicToStore() {
+        return changelogTopicToStore;
+    }
+
     public void connectSourceStoreAndTopic(final String sourceStoreName,
-                                            final String topic) {
+                                           final String topic) {
         if (storeToChangelogTopic.containsKey(sourceStoreName)) {
             throw new TopologyException("Source store " + sourceStoreName + " is already added.");
         }
         storeToChangelogTopic.put(sourceStoreName, topic);
+        changelogTopicToStore.put(topic, sourceStoreName);
     }
 
     public final void addInternalTopic(final String topicName) {
@@ -748,25 +758,16 @@ public class InternalTopologyBuilder {
         return nodeGroups;
     }
 
+    // Order node groups by their position in the actual topology, ie upstream subtopologies come before downstream
     private Map<Integer, Set<String>> makeNodeGroups() {
         final Map<Integer, Set<String>> nodeGroups = new LinkedHashMap<>();
         final Map<String, Set<String>> rootToNodeGroup = new HashMap<>();
 
         int nodeGroupId = 0;
 
-        // Go through source nodes first. This makes the group id assignment easy to predict in tests
-        final Set<String> allSourceNodes = new HashSet<>(nodeToSourceTopics.keySet());
-        allSourceNodes.addAll(nodeToSourcePatterns.keySet());
-
-        for (final String nodeName : Utils.sorted(allSourceNodes)) {
+        // Traverse in topological order
+        for (final String nodeName : nodeFactories.keySet()) {
             nodeGroupId = putNodeGroupName(nodeName, nodeGroupId, nodeGroups, rootToNodeGroup);
-        }
-
-        // Go through non-source nodes
-        for (final String nodeName : Utils.sorted(nodeFactories.keySet())) {
-            if (!nodeToSourceTopics.containsKey(nodeName)) {
-                nodeGroupId = putNodeGroupName(nodeName, nodeGroupId, nodeGroups, rootToNodeGroup);
-            }
         }
 
         return nodeGroups;
@@ -788,30 +789,32 @@ public class InternalTopologyBuilder {
         return newNodeGroupId;
     }
 
-    public synchronized ProcessorTopology build() {
-        return build((Integer) null);
+    /**
+     * @return the full topology minus any global state
+     */
+    public synchronized ProcessorTopology buildTopology() {
+        final Set<String> nodeGroup = new HashSet<>();
+        for (final Set<String> value : nodeGroups().values()) {
+            nodeGroup.addAll(value);
+        }
+        nodeGroup.removeAll(globalNodeGroups());
+
+        initializeSubscription();
+        return build(nodeGroup);
     }
 
-    public synchronized ProcessorTopology build(final Integer topicGroupId) {
-        final Set<String> nodeGroup;
-        if (topicGroupId != null) {
-            nodeGroup = nodeGroups().get(topicGroupId);
-        } else {
-            // when topicGroupId is null, we build the full topology minus the global groups
-            final Set<String> globalNodeGroups = globalNodeGroups();
-            final Collection<Set<String>> values = nodeGroups().values();
-            nodeGroup = new HashSet<>();
-            for (final Set<String> value : values) {
-                nodeGroup.addAll(value);
-            }
-            nodeGroup.removeAll(globalNodeGroups);
-        }
+    /**
+     * @param topicGroupId group of topics corresponding to a single subtopology
+     * @return subset of the full topology
+     */
+    public synchronized ProcessorTopology buildSubtopology(final int topicGroupId) {
+        final Set<String> nodeGroup = nodeGroups().get(topicGroupId);
         return build(nodeGroup);
     }
 
     /**
      * Builds the topology for any global state stores
-     * @return ProcessorTopology
+     * @return ProcessorTopology of global state
      */
     public synchronized ProcessorTopology buildGlobalStateTopology() {
         Objects.requireNonNull(applicationId, "topology has not completed optimization");
@@ -916,7 +919,7 @@ public class InternalTopologyBuilder {
                                  final SourceNode node) {
 
         final List<String> topics = (sourceNodeFactory.pattern != null) ?
-                                    sourceNodeFactory.getTopics(subscriptionUpdates.getUpdates()) :
+                                    sourceNodeFactory.getTopics(subscriptionUpdates()) :
                                     sourceNodeFactory.topics;
 
         for (final String topic : topics) {
@@ -949,6 +952,7 @@ public class InternalTopologyBuilder {
                     if (stateStoreFactory.loggingEnabled() && !storeToChangelogTopic.containsKey(stateStoreName)) {
                         final String changelogTopic = ProcessorStateManager.storeChangelogTopic(applicationId, stateStoreName);
                         storeToChangelogTopic.put(stateStoreName, changelogTopic);
+                        changelogTopicToStore.put(changelogTopic, stateStoreName);
                     }
                     stateStoreMap.put(stateStoreName, stateStoreFactory.build());
                 } else {
@@ -1032,10 +1036,8 @@ public class InternalTopologyBuilder {
                 // if the node is connected to a state store whose changelog topics are not predefined,
                 // add to the changelog topics
                 for (final StateStoreFactory stateFactory : stateFactories.values()) {
-                    if (stateFactory.loggingEnabled() && stateFactory.users().contains(node)) {
-                        final String topicName = storeToChangelogTopic.containsKey(stateFactory.name()) ?
-                                storeToChangelogTopic.get(stateFactory.name()) :
-                                ProcessorStateManager.storeChangelogTopic(applicationId, stateFactory.name());
+                    if (stateFactory.users().contains(node) && storeToChangelogTopic.containsKey(stateFactory.name())) {
+                        final String topicName = storeToChangelogTopic.get(stateFactory.name());
                         if (!stateChangelogTopics.containsKey(topicName)) {
                             final InternalTopicConfig internalTopicConfig =
                                 createChangelogTopicConfig(stateFactory, topicName);
@@ -1057,24 +1059,23 @@ public class InternalTopologyBuilder {
     }
 
     private void setRegexMatchedTopicsToSourceNodes() {
-        if (subscriptionUpdates.hasUpdates()) {
-            for (final Map.Entry<String, Pattern> stringPatternEntry : nodeToSourcePatterns.entrySet()) {
-                final SourceNodeFactory sourceNode =
-                    (SourceNodeFactory) nodeFactories.get(stringPatternEntry.getKey());
-                //need to update nodeToSourceTopics with topics matched from given regex
-                nodeToSourceTopics.put(
-                    stringPatternEntry.getKey(),
-                    sourceNode.getTopics(subscriptionUpdates.getUpdates()));
-                log.debug("nodeToSourceTopics {}", nodeToSourceTopics);
+        if (hasSubscriptionUpdates()) {
+            for (final String nodeName : nodeToSourcePatterns.keySet()) {
+                final SourceNodeFactory sourceNode = (SourceNodeFactory) nodeFactories.get(nodeName);
+                final List<String> sourceTopics = sourceNode.getTopics(subscriptionUpdates);
+                //need to update nodeToSourceTopics and sourceTopicNames with topics matched from given regex
+                nodeToSourceTopics.put(nodeName, sourceTopics);
+                sourceTopicNames.addAll(sourceTopics);
             }
+            log.debug("Updated nodeToSourceTopics: {}", nodeToSourceTopics);
         }
     }
 
     private void setRegexMatchedTopicToStateStore() {
-        if (subscriptionUpdates.hasUpdates()) {
+        if (hasSubscriptionUpdates()) {
             for (final Map.Entry<String, Set<Pattern>> storePattern : stateStoreNameToSourceRegex.entrySet()) {
                 final Set<String> updatedTopicsForStateStore = new HashSet<>();
-                for (final String subscriptionUpdateTopic : subscriptionUpdates.getUpdates()) {
+                for (final String subscriptionUpdateTopic : subscriptionUpdates()) {
                     for (final Pattern pattern : storePattern.getValue()) {
                         if (pattern.matcher(subscriptionUpdateTopic).matches()) {
                             updatedTopicsForStateStore.add(subscriptionUpdateTopic);
@@ -1117,11 +1118,11 @@ public class InternalTopologyBuilder {
                                        final Set<Pattern> resetPatterns) {
         final List<String> topics = maybeDecorateInternalSourceTopics(resetTopics);
 
-        return buildPatternForOffsetResetTopics(topics, resetPatterns);
+        return buildPattern(topics, resetPatterns);
     }
 
-    private static Pattern buildPatternForOffsetResetTopics(final Collection<String> sourceTopics,
-                                                            final Collection<Pattern> sourcePatterns) {
+    private static Pattern buildPattern(final Collection<String> sourceTopics,
+                                        final Collection<Pattern> sourcePatterns) {
         final StringBuilder builder = new StringBuilder();
 
         for (final String topic : sourceTopics) {
@@ -1148,22 +1149,50 @@ public class InternalTopologyBuilder {
         return results;
     }
 
+    public Collection<String> sourceTopicsForStore(final String storeName) {
+        return maybeDecorateInternalSourceTopics(stateStoreNameToSourceTopics.get(storeName));
+    }
+
     public synchronized Collection<Set<String>> copartitionGroups() {
-        final List<Set<String>> list = new ArrayList<>(copartitionSourceGroups.size());
-        for (final Set<String> nodeNames : copartitionSourceGroups) {
-            final Set<String> copartitionGroup = new HashSet<>();
-            for (final String node : nodeNames) {
-                final List<String> topics = nodeToSourceTopics.get(node);
-                if (topics != null) {
-                    copartitionGroup.addAll(maybeDecorateInternalSourceTopics(topics));
+        // compute transitive closures of copartitionGroups to relieve registering code to know all members
+        // of a copartitionGroup at the same time
+        final List<Set<String>> copartitionSourceTopics =
+            copartitionSourceGroups
+                .stream()
+                .map(sourceGroup ->
+                         sourceGroup
+                             .stream()
+                             .flatMap(node -> maybeDecorateInternalSourceTopics(nodeToSourceTopics.get(node)).stream())
+                             .collect(Collectors.toSet())
+                ).collect(Collectors.toList());
+
+        final Map<String, Set<String>> topicsToCopartitionGroup = new LinkedHashMap<>();
+        for (final Set<String> topics : copartitionSourceTopics) {
+            if (topics != null) {
+                Set<String> coparititonGroup = null;
+                for (final String topic : topics) {
+                    coparititonGroup = topicsToCopartitionGroup.get(topic);
+                    if (coparititonGroup != null) {
+                        break;
+                    }
+                }
+                if (coparititonGroup == null) {
+                    coparititonGroup = new HashSet<>();
+                }
+                coparititonGroup.addAll(maybeDecorateInternalSourceTopics(topics));
+                for (final String topic : topics) {
+                    topicsToCopartitionGroup.put(topic, coparititonGroup);
                 }
             }
-            list.add(Collections.unmodifiableSet(copartitionGroup));
         }
-        return Collections.unmodifiableList(list);
+        final Set<Set<String>> uniqueCopartitionGroups = new HashSet<>(topicsToCopartitionGroup.values());
+        return Collections.unmodifiableList(new ArrayList<>(uniqueCopartitionGroups));
     }
 
     private List<String> maybeDecorateInternalSourceTopics(final Collection<String> sourceTopics) {
+        if (sourceTopics == null) {
+            return Collections.emptyList();
+        }
         final List<String> decoratedTopics = new ArrayList<>();
         for (final String topic : sourceTopics) {
             if (internalTopicNames.contains(topic)) {
@@ -1185,35 +1214,29 @@ public class InternalTopologyBuilder {
         return applicationId + "-" + topic;
     }
 
-    SubscriptionUpdates subscriptionUpdates() {
-        return subscriptionUpdates;
+    void initializeSubscription() {
+        if (usesPatternSubscription()) {
+            log.debug("Found pattern subscribed source topics, initializing consumer's subscription pattern.");
+            final List<String> allSourceTopics = maybeDecorateInternalSourceTopics(sourceTopicNames);
+            Collections.sort(allSourceTopics);
+            sourceTopicPattern = buildPattern(allSourceTopics, nodeToSourcePatterns.values());
+        } else {
+            log.debug("No source topics using pattern subscription found, initializing consumer's subscription collection.");
+            sourceTopicCollection = maybeDecorateInternalSourceTopics(sourceTopicNames);
+            Collections.sort(sourceTopicCollection);
+        }
+    }
+
+    boolean usesPatternSubscription() {
+        return !nodeToSourcePatterns.isEmpty();
+    }
+
+    synchronized Collection<String> sourceTopicCollection() {
+        return sourceTopicCollection;
     }
 
     synchronized Pattern sourceTopicPattern() {
-        if (topicPattern == null) {
-            final List<String> allSourceTopics = new ArrayList<>();
-            if (!nodeToSourceTopics.isEmpty()) {
-                for (final List<String> topics : nodeToSourceTopics.values()) {
-                    allSourceTopics.addAll(maybeDecorateInternalSourceTopics(topics));
-                }
-                allSourceTopics.removeAll(globalTopics);
-            }
-            Collections.sort(allSourceTopics);
-
-            topicPattern = buildPatternForOffsetResetTopics(allSourceTopics, nodeToSourcePatterns.values());
-        }
-
-        return topicPattern;
-    }
-
-    // package-private for testing only
-    synchronized void updateSubscriptions(final SubscriptionUpdates subscriptionUpdates,
-                                          final String logPrefix) {
-        log.debug("{}updating builder with {} topic(s) with possible matching regex subscription(s)",
-                logPrefix, subscriptionUpdates);
-        this.subscriptionUpdates = subscriptionUpdates;
-        setRegexMatchedTopicsToSourceNodes();
-        setRegexMatchedTopicToStateStore();
+        return sourceTopicPattern;
     }
 
     private boolean isGlobalSource(final String nodeName) {
@@ -1475,7 +1498,7 @@ public class InternalTopologyBuilder {
         @Override
         public String toString() {
             final String topicsString = topics == null ? topicPattern.toString() : topics.toString();
-            
+
             return "Source: " + name + " (topics: " + topicsString + ")\n      --> " + nodeNames(successors);
         }
 
@@ -1677,7 +1700,7 @@ public class InternalTopologyBuilder {
 
     public static class TopicsInfo {
         final Set<String> sinkTopics;
-        final Set<String> sourceTopics;
+        public final Set<String> sourceTopics;
         public final Map<String, InternalTopicConfig> stateChangelogTopics;
         public final Map<String, InternalTopicConfig> repartitionSourceTopics;
 
@@ -1689,6 +1712,20 @@ public class InternalTopologyBuilder {
             this.sourceTopics = sourceTopics;
             this.stateChangelogTopics = stateChangelogTopics;
             this.repartitionSourceTopics = repartitionSourceTopics;
+        }
+
+        /**
+         * Returns the config for any changelogs that must be prepared for this topic group, ie excluding any source
+         * topics that are reused as a changelog
+         */
+        public Set<InternalTopicConfig> nonSourceChangelogTopics() {
+            final Set<InternalTopicConfig> topicConfigs = new HashSet<>();
+            for (final Map.Entry<String, InternalTopicConfig> changelogTopicEntry : stateChangelogTopics.entrySet()) {
+                if (!sourceTopics.contains(changelogTopicEntry.getKey())) {
+                    topicConfigs.add(changelogTopicEntry.getValue());
+                }
+            }
+            return topicConfigs;
         }
 
         @Override
@@ -1841,50 +1878,52 @@ public class InternalTopologyBuilder {
         return sb.toString();
     }
 
-    /**
-     * Used to capture subscribed topic via Patterns discovered during the
-     * partition assignment process.
-     */
-    public static class SubscriptionUpdates {
+    private Set<String> subscriptionUpdates() {
+        return Collections.unmodifiableSet(subscriptionUpdates);
+    }
 
-        private final Set<String> updatedTopicSubscriptions = new HashSet<>();
+    private boolean hasSubscriptionUpdates() {
+        return !subscriptionUpdates.isEmpty();
+    }
 
-        private void updateTopics(final Collection<String> topicNames) {
-            updatedTopicSubscriptions.clear();
-            updatedTopicSubscriptions.addAll(topicNames);
-        }
+    synchronized void addSubscribedTopicsFromAssignment(final List<TopicPartition> partitions, final String logPrefix) {
+        if (usesPatternSubscription()) {
+            final Set<String> assignedTopics = new HashSet<>();
+            for (final TopicPartition topicPartition : partitions) {
+                assignedTopics.add(topicPartition.topic());
+            }
 
-        public Collection<String> getUpdates() {
-            return Collections.unmodifiableSet(updatedTopicSubscriptions);
-        }
+            final Collection<String> existingTopics = subscriptionUpdates();
 
-        boolean hasUpdates() {
-            return !updatedTopicSubscriptions.isEmpty();
-        }
-
-        @Override
-        public String toString() {
-            return String.format("SubscriptionUpdates{updatedTopicSubscriptions=%s}", updatedTopicSubscriptions);
+            if  (!existingTopics.equals(assignedTopics)) {
+                assignedTopics.addAll(existingTopics);
+                updateSubscribedTopics(assignedTopics, logPrefix);
+            }
         }
     }
 
-    void updateSubscribedTopics(final Set<String> topics,
-                                final String logPrefix) {
-        final SubscriptionUpdates subscriptionUpdates = new SubscriptionUpdates();
-        log.debug("{}found {} topics possibly matching regex", logPrefix, topics);
-        // update the topic groups with the returned subscription set for regex pattern subscriptions
-        subscriptionUpdates.updateTopics(topics);
-        updateSubscriptions(subscriptionUpdates, logPrefix);
+    synchronized void addSubscribedTopicsFromMetadata(final Set<String> topics, final String logPrefix) {
+        if (usesPatternSubscription() && !subscriptionUpdates().equals(topics)) {
+            updateSubscribedTopics(topics, logPrefix);
+        }
     }
 
+    private void updateSubscribedTopics(final Set<String> topics, final String logPrefix) {
+        subscriptionUpdates.clear();
+        subscriptionUpdates.addAll(topics);
+
+        log.debug("{}found {} topics possibly matching subscription", logPrefix, topics.size());
+
+        setRegexMatchedTopicsToSourceNodes();
+        setRegexMatchedTopicToStateStore();
+    }
 
     // following functions are for test only
-
-    public synchronized Set<String> getSourceTopicNames() {
+    public synchronized Set<String> sourceTopicNames() {
         return sourceTopicNames;
     }
 
-    public synchronized Map<String, StateStoreFactory> getStateStores() {
+    public synchronized Map<String, StateStoreFactory> stateStores() {
         return stateFactories;
     }
 }
